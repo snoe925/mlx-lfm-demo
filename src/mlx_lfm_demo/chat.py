@@ -1,6 +1,6 @@
 import json
 from mlx_lm import load, generate, stream_generate
-from tools import tool_call, TOOLS
+from .tools import tool_call, TOOLS
 
 TOOL_START_TOKEN = "<|tool_call_start|>"
 TOOL_END_TOKEN = "<|tool_call_end|>"
@@ -38,7 +38,8 @@ class Chat:
                 system_md_content = f.read().strip()
                 system_content = f"{system_md_content}\n\n{system_content}"
         except FileNotFoundError:
-            pass  # Use default system prompt if AGENT.md doesn't exist
+            print("No LFMAGENT.md file found")
+            # Use default system prompt if LFMAGENT.md doesn't exist
         return system_content
     
     def run_chat(self, messages):

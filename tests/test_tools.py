@@ -1,7 +1,7 @@
 import os
 import json
 import pytest
-from tools import (
+from mlx_lfm_demo.tools import (
     get_safe_path, 
     handle_list_files, 
     handle_read_file, 
@@ -38,7 +38,9 @@ def test_handle_list_files_success(tmp_path):
 def test_handle_list_files_current_dir():
     result = handle_list_files({"directory": "."})
     assert isinstance(result, list)
-    assert "main.py" in result or "tools.py" in result
+    # Check for files that exist in the project root
+    expected_files = ["LICENSE", "README.md", "pyproject.toml"]
+    assert any(file in result for file in expected_files)
 
 def test_handle_list_files_invalid_dir():
     result = handle_list_files({"directory": "non_existent_dir_12345"})

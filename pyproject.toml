@@ -29,3 +29,6 @@ packages = ["src/mlx_lfm_demo"]
 dev = [
     "pytest>=9.0.1",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = "src"

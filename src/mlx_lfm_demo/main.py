@@ -1,5 +1,5 @@
 import sys
-from chat import Chat
+from .chat import Chat
 
 def main():
     # Initialize chat instance
