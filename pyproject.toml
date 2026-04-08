@@ -14,7 +14,7 @@ dependencies = [
 py-modules = ["main", "chat", "tools"]
 
 [project.scripts]
-run-app = "main"
+run-app = mlx_lfm_demo:main"
 
 [dependency-groups]
 dev = [
