@@ -13,6 +13,9 @@ dependencies = [
 [tool.setuptools]
 py-modules = ["main", "chat", "tools"]
 
+[project.scripts]
+run-app = "main"
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.1",
