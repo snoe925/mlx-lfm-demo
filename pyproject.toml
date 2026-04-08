@@ -10,6 +10,9 @@ dependencies = [
     "transformers>=5.5.0",
 ]
 
+[tool.setuptools]
+py-modules = ["main", "chat", "tools"]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.1",
