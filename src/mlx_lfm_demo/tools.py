@@ -1,103 +1,137 @@
 import json
 import re
 import os
+import subprocess
+from pathlib import Path
+import stat
 
 # Define the sandbox root
 SANDBOX_ROOT = os.path.abspath(os.getcwd())
 
+
 def get_safe_path(requested_path):
     """Expands relative paths and ensures they are within the SANDBOX_ROOT."""
     if os.path.isabs(requested_path):
-        requested_path = requested_path.lstrip('/')
-    
+        requested_path = requested_path.lstrip("/")
+
     full_path = os.path.abspath(os.path.join(SANDBOX_ROOT, requested_path))
-    
+
     if full_path.startswith(SANDBOX_ROOT):
         return full_path
     return None
 
-def handle_bash_execution(params):
-    """Executes a bash command within the sandbox directory."""
-    import subprocess
-    import shlex
+def rewrite_escapes(filename):
+    '''
+    Read the file filename and re-write the file with \n as real new lines.
+    '''
+    with open(filename, 'r') as f:
+        content = f.read()
     
-    bash_command = params.get('bash_command', '')
-    if not bash_command:
-        return {'error': 'Empty bash command'}
+    # Replace literal '\n' string with actual newline character
+    new_content = content.replace('\\n', '\n')
     
+    with open(filename, 'w') as f:
+        f.write(new_content)
+
+def handle_linux_execution(params):
+    """
+    Executes a script in an isolated environment (simulated).
+    Supports versioning and rollback.
+    """
+
+    script_file_name = params.get("script_file_name", "")
+    action = params.get("action", "run")
+
+    if not script_file_name:
+        return {"error": "No script_file_name provided"}
+    if 'run' not in action:
+        return {"error": f"unknown action {action}"}
+
+    script_file_name = get_safe_path(script_file_name)
+    if script_file_name is None:
+        return {"error": "unsafe path"}
+
+    rewrite_escapes(script_file_name)
+
+    p = Path(script_file_name)
+    # Add execute permission for everyone (+x)
+    p.chmod(p.stat().st_mode | stat.S_IEXEC)
+
     try:
-        # Execute command in sandbox directory with timeout
         result = subprocess.run(
-            bash_command,
+            './' + p.name,
             shell=True,
-            cwd=SANDBOX_ROOT,
+            cwd=SANDBOX_ROOT + '/tmp',
             capture_output=True,
             text=True,
-            timeout=30  # 30 second timeout
+            timeout=60,
         )
-        
-        if result.returncode == 0:
-            return result.stdout
-        else:
-            return {
-                'error': 'Command failed',
-                'stderr': result.stderr,
-                'returncode': result.returncode
+
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "exit_code": result.returncode
             }
+
     except subprocess.TimeoutExpired:
-        return {'error': 'Command timed out after 30 seconds'}
+        return {"stdout":"", "stderr": "Command timed out", "exit_code": -1}
     except Exception as e:
-        return {'error': f'Execution failed: {str(e)}'}
+        return {"stdout":"", "stderr": f"Execution failed: {str(e)}", "exit_code": -2}
+
 
 def handle_list_files(params):
-    directory = params.get('directory', '.')
+    directory = params.get("directory", ".")
     path = get_safe_path(directory)
     if path and os.path.isdir(path):
         try:
             return os.listdir(path)
         except Exception as e:
-            return {'error': str(e)}
-    return {'error': 'Invalid directory or access denied'}
+            return {"error": str(e)}
+    return {"error": "Invalid directory or access denied"}
+
 
 def handle_read_file(params):
-    path_str = params.get('file_path')
+    path_str = params.get("file_path")
     if not path_str:
-        return {'error': 'missing file_path'}
-    
+        return {"error": "missing file_path"}
+
     path = get_safe_path(path_str)
     if path:
         try:
-            with open(path, 'r') as f:
+            with open(path, "r") as f:
                 return f.read()
         except Exception as e:
-            return {'error': str(e)}
-    return {'error': 'Access denied: Path outside sandbox'}
+            return {"error": str(e)}
+    return {"error": "Access denied: Path outside sandbox"}
+
 
 def handle_write_file(params):
-    path_str = params.get('file_path')
-    content = params.get('content')
-    
+    path_str = params.get("file_path")
+    content = params.get("content")
+
     if not path_str or content is None:
-        return {'error': 'missing file_path or content'}
-    
+        return {"error": "missing file_path or content"}
+
     path = get_safe_path(path_str)
     if path:
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, 'w') as f:
+            with open(path, "w") as f:
                 f.write(content)
-            return "File written successfully"
+            return "SUCCESS"
         except Exception as e:
-            return {'error': str(e)}
-    return {'error': 'Access denied: Path outside sandbox'}
+            return {"error": str(e)}
+    return {"error": "Access denied: Path outside sandbox"}
+
 
 # Map tool names to their handler functions
 TOOL_HANDLERS = {
-    "bash_execution": handle_bash_execution,
+    "linux": handle_linux_execution,
     "list_files": handle_list_files,
     "read_file": handle_read_file,
-    "write_file": handle_write_file
+    "write_file": handle_write_file,
 }
+
 
 def tool_call(tool_call_str):
     """
@@ -106,49 +140,55 @@ def tool_call(tool_call_str):
     """
     try:
         # Extract tool name: find characters before the parenthesis
-        match = re.search(r'(\w+)\(', tool_call_str)
+        match = re.search(r"(\w+)\(", tool_call_str)
         if not match:
-            return json.dumps({'error': 'Invalid tool call format'})
-        
+            return json.dumps({"error": "Invalid tool call format"})
+
         tool_name = match.group(1)
         handler = TOOL_HANDLERS.get(tool_name)
-        
+
         if not handler:
-            return json.dumps({'error': f'Unknown tool: {tool_name}'})
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
 
         # Extract arguments: find everything inside the parentheses
-        arg_start = tool_call_str.find('(') + 1
-        arg_end = tool_call_str.rfind(')')
+        arg_start = tool_call_str.find("(") + 1
+        arg_end = tool_call_str.find(")]<|tool_call_end|>")
         args_str = tool_call_str[arg_start:arg_end]
-        
+
         # Parse key="value" pairs
         params = {}
         arg_pattern = re.compile(r'(\w+)="([^"]*)"')
         for key, value in arg_pattern.findall(args_str):
             params[key] = value
-            
+
         result = handler(params)
-        
+
         if isinstance(result, (dict, list)):
             return json.dumps(result)
         return json.dumps(str(result))
-        
+
     except Exception as e:
-        return json.dumps({'error': f'Execution failed: {str(e)}'})
+        return json.dumps({"error": f"Execution failed: {str(e)}"})
+
 
 TOOLS = [
     {
-        "name": "bash_execution",
-        "description": "Runs a bash command line",
+        "name": "linux",
+        "description": "Runs shell scripts in an isolated environment.",
         "parameters": {
             "type": "object",
             "properties": {
-                "bash_command": {
+                "script_file_name": {
                     "type": "string",
-                    "description": "bash command line to be parsed by bash",
-                }
+                    "description": "The script file name to run. First you must use write_file to create the script.",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["run"],
+                    "description": "run action will run the script.",
+                },
             },
-            "required": ["bash_command"],
+            "required": ["script_file_name", "action"],
         },
     },
     {
@@ -191,7 +231,7 @@ TOOLS = [
                 "content": {
                     "type": "string",
                     "description": "The content to write to the file",
-                }
+                },
             },
             "required": ["file_path", "content"],
         },

@@ -11,6 +11,8 @@ requires-python = ">=3.13"
 dependencies = [
     "mlx>=0.31.1",
     "mlx-lm",
+    "qemu.qmp",
+    "ruff>=0.15.10",
     "transformers>=5.5.0",
 ]
 
@@ -31,4 +33,5 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = "src"
+pythonpath = ["src"]
+addopts = "--disable-warnings"
