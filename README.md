@@ -12,6 +12,11 @@ Included in the project is a QEMU based container in "sandbox.py".
 But this is not a secure container.
 The AI can still ruin your machine or worse.
 
+# TODO
+Rework the chat proper cli program for the last refactoring.
+Add more step wise tests in pytest.
+Use the sandbox.py with the linux tool runner.
+
 # Tools
 The tools are:
 read file, write file, list files and linux.
