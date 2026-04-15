@@ -1,10 +1,12 @@
 import os
 import json
+import mlx_lfm_demo.tools as tools_module
 from mlx_lfm_demo.tools import (
     get_safe_path,
     handle_list_files,
     handle_read_file,
     handle_write_file,
+    handle_wget,
     tool_call,
     SANDBOX_ROOT,
 )
@@ -109,3 +111,59 @@ def test_tool_call_malformed():
     res = json.loads(res_str)
     assert "error" in res
     assert "Invalid tool call format" in res["error"]
+
+
+class _FakeResponse:
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def test_handle_wget_success(monkeypatch):
+    payload = b"fake zip bytes"
+
+    def fake_urlopen(url, timeout=30):
+        assert url == "https://example.com/file.zip"
+        assert timeout == 30
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(tools_module, "urlopen", fake_urlopen)
+
+    result = handle_wget(
+        {"url": "https://example.com/file.zip", "file_name": "test-file.zip"}
+    )
+
+    assert result["status"] == "SUCCESS"
+    assert result["file_path"] == "tmp/test-file.zip"
+    assert result["bytes"] == len(payload)
+
+    with open("tmp/test-file.zip", "rb") as f:
+        assert f.read() == payload
+    os.remove("tmp/test-file.zip")
+
+
+def test_tool_call_parsing_wget(monkeypatch):
+    payload = b"hello"
+
+    def fake_urlopen(url, timeout=30):
+        assert url == "https://example.com/a.zip"
+        return _FakeResponse(payload)
+
+    monkeypatch.setattr(tools_module, "urlopen", fake_urlopen)
+
+    res_str = tool_call('wget(url="https://example.com/a.zip", file_name="a.zip")')
+    res = json.loads(res_str)
+    assert res["status"] == "SUCCESS"
+    assert res["file_path"] == "tmp/a.zip"
+
+    with open("tmp/a.zip", "rb") as f:
+        assert f.read() == payload
+    os.remove("tmp/a.zip")

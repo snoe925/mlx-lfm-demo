@@ -1,11 +1,20 @@
 import sys
 import json
-from .chat import Chat
+from .lfm_chat import LfmChat
+
+
+def _print_new_messages(previous, current):
+    for message in current[len(previous) :]:
+        role = message.get("role")
+        if role == "assistant":
+            print(message.get("content", ""))
+        elif role == "tool":
+            print(f"[tool] {message.get('content', '')}")
 
 
 def main():
     # Initialize chat instance
-    chat = Chat()
+    chat = LfmChat()
     # Conversation history
     conversation = []
 
@@ -24,10 +33,18 @@ def main():
             line = line.rstrip("\n")
 
             if line == "/go":
-                # Process the accumulated messages
-                conversation = chat.run_chat(conversation)
-                # After processing, the conversation already includes the assistant's response
-                # Continue to next input
+                max_turns = 8
+                for _ in range(max_turns):
+                    previous_conversation = list(conversation)
+                    conversation = chat.chat(conversation)
+                    _print_new_messages(previous_conversation, conversation)
+
+                    previous_conversation = list(conversation)
+                    conversation = chat.execute_tool_calls(conversation)
+                    _print_new_messages(previous_conversation, conversation)
+
+                    if len(previous_conversation) == len(conversation):
+                        break
             elif line == "/clear":
                 # Clear the conversation history
                 conversation = []

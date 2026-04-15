@@ -3,6 +3,24 @@ from datetime import datetime
 from mlx_lfm_demo.lfm_chat import LfmChat
 
 
+def _chat_until_tool_call(chat, messages, expected_fragment, max_turns=3):
+    current = list(messages)
+    for _ in range(max_turns):
+        current = chat.chat(current)
+        last = current[-1]["content"]
+        if expected_fragment in last:
+            return current, last
+
+        # The default system prompt often requires explicit user confirmation.
+        if "confirm" in last.lower() or '"yes"' in last.lower():
+            current.append({"role": "user", "content": "yes"})
+            continue
+
+        break
+
+    return current, current[-1]["content"]
+
+
 def test_lfm_chat_nearest_star():
     """LfmChat answers a simple factual question."""
     chat = LfmChat()
@@ -21,10 +39,13 @@ def test_lfm_chat_write_a_date_script():
         {"role": "user", "content": "Write a script to call the linux date program."}
     ]
 
-    updated_messages = chat.chat(messages)
+    updated_messages, last = _chat_until_tool_call(
+        chat,
+        messages,
+        '<|tool_call_start|>[write_file(file_path="./tmp/',
+    )
 
     assert updated_messages[-1]["role"] == "assistant"
-    last = updated_messages[-1]["content"]
     tool_call_1 = (
         '<|tool_call_start|>[write_file(file_path="./tmp/'  # script name can vary
     )
@@ -43,10 +64,13 @@ def test_lfm_chat_write_a_date_script_and_run():
         }
     ]
 
-    updated_messages = chat.chat(messages)
+    updated_messages, last = _chat_until_tool_call(
+        chat,
+        messages,
+        '<|tool_call_start|>[write_file(file_path="./tmp/',
+    )
 
     assert updated_messages[-1]["role"] == "assistant"
-    last = updated_messages[-1]["content"]
     tool_call_1 = (
         '<|tool_call_start|>[write_file(file_path="./tmp/'  # script name can vary
     )
@@ -58,8 +82,11 @@ def test_lfm_chat_write_a_date_script_and_run():
 
     updated_messages.append(tool_call_result)
 
-    after_run = chat.chat(updated_messages)
-    last = after_run[-1]["content"]
+    after_run, last = _chat_until_tool_call(
+        chat,
+        updated_messages,
+        "linux(script_file_name",
+    )
     assert 'action="run"' in last
     assert "linux(script_file_name" in last
     tool_call_result = chat.execute_tool_call(last)

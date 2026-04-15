@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 import stat
+from urllib.parse import urlparse
+from urllib.request import urlopen
 
 # Define the sandbox root
 SANDBOX_ROOT = os.path.abspath(os.getcwd())
@@ -20,18 +22,20 @@ def get_safe_path(requested_path):
         return full_path
     return None
 
+
 def rewrite_escapes(filename):
-    '''
+    """
     Read the file filename and re-write the file with \n as real new lines.
-    '''
-    with open(filename, 'r') as f:
+    """
+    with open(filename, "r") as f:
         content = f.read()
-    
+
     # Replace literal '\n' string with actual newline character
-    new_content = content.replace('\\n', '\n')
-    
-    with open(filename, 'w') as f:
+    new_content = content.replace("\\n", "\n")
+
+    with open(filename, "w") as f:
         f.write(new_content)
+
 
 def handle_linux_execution(params):
     """
@@ -44,7 +48,7 @@ def handle_linux_execution(params):
 
     if not script_file_name:
         return {"error": "No script_file_name provided"}
-    if 'run' not in action:
+    if "run" not in action:
         return {"error": f"unknown action {action}"}
 
     script_file_name = get_safe_path(script_file_name)
@@ -59,9 +63,9 @@ def handle_linux_execution(params):
 
     try:
         result = subprocess.run(
-            './' + p.name,
+            "./" + p.name,
             shell=True,
-            cwd=SANDBOX_ROOT + '/tmp',
+            cwd=SANDBOX_ROOT + "/tmp",
             capture_output=True,
             text=True,
             timeout=60,
@@ -70,13 +74,13 @@ def handle_linux_execution(params):
         return {
             "stdout": result.stdout,
             "stderr": result.stderr,
-            "exit_code": result.returncode
-            }
+            "exit_code": result.returncode,
+        }
 
     except subprocess.TimeoutExpired:
-        return {"stdout":"", "stderr": "Command timed out", "exit_code": -1}
+        return {"stdout": "", "stderr": "Command timed out", "exit_code": -1}
     except Exception as e:
-        return {"stdout":"", "stderr": f"Execution failed: {str(e)}", "exit_code": -2}
+        return {"stdout": "", "stderr": f"Execution failed: {str(e)}", "exit_code": -2}
 
 
 def handle_list_files(params):
@@ -124,12 +128,53 @@ def handle_write_file(params):
     return {"error": "Access denied: Path outside sandbox"}
 
 
+def handle_wget(params):
+    """Download a URL into ./tmp and return metadata."""
+    url = params.get("url")
+    file_name = params.get("file_name")
+
+    if not url:
+        return {"error": "missing url"}
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return {"error": "url must use http or https"}
+
+    if not file_name:
+        guessed_name = os.path.basename(parsed.path)
+        file_name = guessed_name or "download.bin"
+
+    file_name = os.path.basename(file_name)
+    if not file_name:
+        return {"error": "invalid file_name"}
+
+    tmp_dir = os.path.join(SANDBOX_ROOT, "tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    output_path = os.path.join(tmp_dir, file_name)
+
+    try:
+        with urlopen(url, timeout=30) as response:
+            content = response.read()
+
+        with open(output_path, "wb") as f:
+            f.write(content)
+
+        return {
+            "status": "SUCCESS",
+            "file_path": os.path.relpath(output_path, SANDBOX_ROOT),
+            "bytes": len(content),
+        }
+    except Exception as e:
+        return {"error": f"download failed: {str(e)}"}
+
+
 # Map tool names to their handler functions
 TOOL_HANDLERS = {
     "linux": handle_linux_execution,
     "list_files": handle_list_files,
     "read_file": handle_read_file,
     "write_file": handle_write_file,
+    "wget": handle_wget,
 }
 
 
@@ -234,6 +279,24 @@ TOOLS = [
                 },
             },
             "required": ["file_path", "content"],
+        },
+    },
+    {
+        "name": "wget",
+        "description": "Downloads a URL into ./tmp",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "HTTP/HTTPS URL to download",
+                },
+                "file_name": {
+                    "type": "string",
+                    "description": "Optional output file name under ./tmp",
+                },
+            },
+            "required": ["url"],
         },
     },
 ]

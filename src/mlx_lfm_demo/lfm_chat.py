@@ -1,36 +1,19 @@
 from typing import List, Dict, Any, Optional
-import json
-from mlx_lm import load, stream_generate
-from .tools import tool_call, TOOLS
-from .chat import BaseChat
+
+from mlx_lm import stream_generate
+
+from .chat import Chat
+from .tools import tool_call
 
 TOOL_START_TOKEN = "<|tool_call_start|>"
 TOOL_END_TOKEN = "<|tool_call_end|>"
 
 
-class LfmChat(BaseChat):
+class LfmChat(Chat):
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or "LiquidAI/LFM2.5-1.2B-Instruct"
-        self.model = None
-        self.tokenizer = None
-        self.tools = TOOLS
-        self.system_content = ""
+        resolved_model_name = model_name or "LiquidAI/LFM2.5-1.2B-Instruct"
+        super().__init__(model_name=resolved_model_name)
         self.tool_call_count = 0
-
-        res = load(self.model_name)
-        self.model = res[0]
-        self.tokenizer = res[1]
-        self.system_content = self._build_system_content()
-
-    def _build_system_content(self) -> str:
-        system_content = "List of tools: " + json.dumps(self.tools)
-        try:
-            with open("LFMAGENT.md", "r") as f:
-                system_md_content = f.read().strip()
-                system_content = f"{system_md_content}\n\n{system_content}"
-        except FileNotFoundError:
-            pass
-        return system_content
 
     def chat(
         self, messages: List[Dict[str, Any]], canned_response: Optional[str] = None
@@ -98,7 +81,7 @@ class LfmChat(BaseChat):
         return current_messages
 
     def execute_tool_call(self, content: str) -> Dict[str, Any]:
-        '''
+        """
         <|tool_call_start|>[write_file(file_path="./tmp/date_script.sh", content="#!/bin/bash\\ndate")]<|tool_call_end|>
-        '''
-        return {"role":"tool", "content": tool_call(content)}
+        """
+        return {"role": "tool", "content": tool_call(content)}
