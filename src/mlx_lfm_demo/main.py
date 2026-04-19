@@ -14,13 +14,6 @@ def _print_new_messages(previous, current):
             print(f"[tool] {message.get('content', '')}")
         elif role == "user":
             print("user")
-        # After any output we flush so the terminal shows it even if
-        # stdout is redirected or piped.
-        print()  # newline
-        # Some terminals need an explicit flush to break buffering.
-        import sys
-
-        sys.stdout.flush()
 
 
 def main():
@@ -115,7 +108,7 @@ def main():
                 previous_blank = False
 
             if line == "/go":
-                max_turns = 8
+                max_turns = 20
                 for _ in range(max_turns):
                     previous_conversation = list(conversation)
                     # Surface a clear "model running" marker before each
@@ -131,6 +124,7 @@ def main():
                     _print_new_messages(previous_conversation, conversation)
 
                     if len(previous_conversation) == len(conversation):
+                        print("user", flush=True)
                         break
             elif line == "/clear":
                 # Clear the conversation history

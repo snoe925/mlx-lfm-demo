@@ -76,3 +76,5 @@ write_file(file_path="./share/tmp/run_date.sh", content="#!/bin/sh date\n")     
 ```
 
 The only characters that may appear between `#!/bin/sh` and the first `\n` are interpreter flags such as `-eu` (e.g. `"#!/bin/sh -eu\ndate\n"`). If you are not passing interpreter flags, the character right after the shebang path MUST be `\n`.
+
+Do not write echo unless asked to use echo command in a script.  Do not write display unless asked to use display.
