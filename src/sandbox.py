@@ -8,6 +8,48 @@ For --install, we boot an initramfs helper that mounts /dev/vda2 at /newroot,
 installs one-run systemd files into that rootfs, syncs, and powers off.
 Before install boot, we create an automatic disk snapshot for rollback safety.
 On the next normal boot, the one-run service executes the single /mnt/share/tmp/*.sh and powers off.
+
+Example runs
+------------
+
+    # Default: run the single ./share/tmp/*.sh script via the installed
+    # one-run systemd unit, then power off.
+    python src/sandbox.py
+
+    # Bootstrap a fresh checkout: fetch the aarch64 kernel Image.gz from a
+    # known tarball if it's not already present.
+    python src/sandbox.py --download-kernel
+
+    # Patch sandbox.qcow2 in-place with the one-run systemd unit (creates an
+    # automatic preinstall snapshot first for rollback safety).
+    python src/sandbox.py --install
+
+    # Boot a BusyBox initramfs shell on the serial console (no rootfs, no
+    # services). Useful for poking at the bare kernel.
+    python src/sandbox.py --busybox
+
+    # Drop the installed one-run service into an interactive /bin/sh on the
+    # serial console instead of running a script. Equivalent to
+    # ONERUN_DEBUG=1 python src/sandbox.py.
+    python src/sandbox.py --shell
+
+    # --oneshot: ad-hoc `bash -c "..."`-style invocation. Builds a toybox
+    # cpio root ramdisk in pure Python, boots it as the only rootfs (no
+    # disk image required), and runs the command via toybox's `oneit` so
+    # the guest powers off as soon as the command exits. The command is
+    # forwarded to /init via the kernel's `--` argv mechanism. Auto-fetches
+    # ./toybox-aarch64 if missing. -c is a shorthand for --oneshot so the
+    # CLI mirrors `sh -c`.
+    python src/sandbox.py --oneshot "uname -a && echo done"
+    python src/sandbox.py -c "uname -a && echo done"
+
+    # --oneshot with the 9p share disabled, for the fastest possible boot
+    # when the command doesn't need to touch ./share.
+    python src/sandbox.py -c "echo hi" --no-9p
+
+    # Dry run any of the above to inspect the exact qemu-system-aarch64
+    # command line without actually launching QEMU.
+    python src/sandbox.py --oneshot "echo hi" --dry-run
 """
 
 import argparse
@@ -38,6 +80,12 @@ DEFAULT_KERNEL_TARBALL_URL = (
     "http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz"
 )
 DEFAULT_KERNEL_MEMBER_CANDIDATES = ("boot/Image.gz", "./boot/Image.gz", "Image.gz")
+
+# Upstream for a prebuilt static aarch64 toybox binary. Used by --oneshot so a
+# fresh checkout works with no manual setup -- if no local toybox-aarch64
+# (or toybox-arm64 / toybox) is present, it is fetched into the repo root.
+DEFAULT_TOYBOX_URL = "https://landley.net/toybox/bin/toybox-aarch64"
+DEFAULT_TOYBOX_PATH = Path("./toybox-aarch64")
 
 
 class QMPClient:
@@ -621,6 +669,267 @@ def resolve_busybox_binary_path(configured_path=None):
     sys.exit(1)
 
 
+def download_toybox(url=DEFAULT_TOYBOX_URL, dest_path=DEFAULT_TOYBOX_PATH):
+    """Download a prebuilt aarch64 toybox binary into ``dest_path``.
+
+    Never overwrites an existing file. Marks the result executable on success.
+    Returns the resolved Path on success; exits the process on failure.
+    """
+    dest_path = Path(dest_path)
+    if dest_path.exists():
+        print(
+            f"toybox already present at {dest_path.absolute()}; refusing to overwrite."
+        )
+        return dest_path
+
+    tmp_dir = Path("./tmp")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dest = tmp_dir / f"toybox-{os.getpid()}-{int(time.time())}.partial"
+
+    print(f"Downloading toybox: {url}")
+    print(f"  -> {dest_path}")
+    try:
+        _stream_download(url, temp_dest)
+    except Exception as exc:
+        if temp_dest.exists():
+            try:
+                temp_dest.unlink()
+            except OSError:
+                pass
+        print(f"Error: failed to download {url}: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    # Re-check destination just before renaming so a concurrent writer cannot
+    # be silently replaced.
+    if dest_path.exists():
+        print(
+            f"toybox appeared at {dest_path.absolute()} during download; "
+            "leaving existing file in place."
+        )
+        try:
+            temp_dest.unlink()
+        except OSError:
+            pass
+        return dest_path
+
+    try:
+        os.replace(temp_dest, dest_path)
+        dest_path.chmod(0o755)
+    except OSError as exc:
+        if temp_dest.exists():
+            try:
+                temp_dest.unlink()
+            except OSError:
+                pass
+        print(f"Error installing toybox: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Installed toybox: {dest_path.absolute()}")
+    return dest_path
+
+
+def resolve_toybox_binary_path(configured_path=None, auto_download=True):
+    """Resolve toybox aarch64 binary path from explicit value or common defaults.
+
+    When ``auto_download`` is True (the default) and no local binary is found,
+    a prebuilt aarch64 toybox is fetched from ``DEFAULT_TOYBOX_URL`` and
+    written to ``./toybox-aarch64``.
+    """
+    if configured_path is not None:
+        toybox_path = Path(configured_path)
+        if toybox_path.exists() and toybox_path.is_file():
+            return toybox_path
+
+        print(
+            f"Error: toybox binary not found: {toybox_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    candidates = [
+        Path("./toybox-aarch64"),
+        Path("./toybox-arm64"),
+        Path("./toybox"),
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    if auto_download:
+        print(
+            "No local toybox binary found; downloading a prebuilt aarch64 "
+            "toybox to ./toybox-aarch64..."
+        )
+        return download_toybox()
+
+    print(
+        "Error: toybox binary not found. Checked ./toybox-aarch64, "
+        "./toybox-arm64, and ./toybox.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
+def create_oneit_init_script(with_9p=True):
+    """Generate the /init script used inside the oneshot initramfs.
+
+    The kernel invokes /init as PID 1 with whatever argv was provided after
+    ``--`` on the kernel command line. We mount the standard pseudo
+    filesystems (and, when ``with_9p`` is True, the 9p share at
+    /mnt/share), then ``exec`` toybox's ``oneit`` applet which runs the
+    requested command and powers the guest off when it finishes.
+    """
+    if with_9p:
+        mkdir_line = "/bin/mkdir -p /proc /sys /dev /tmp /mnt /mnt/share"
+        mount_lines = [
+            "/bin/mount -t proc proc /proc 2>/dev/null",
+            "/bin/mount -t sysfs sysfs /sys 2>/dev/null",
+            "/bin/mount -t devtmpfs devtmpfs /dev 2>/dev/null",
+            "/bin/mount -t 9p -o trans=virtio,version=9p2000.L share /mnt/share "
+            "2>/dev/null || true",
+        ]
+    else:
+        mkdir_line = "/bin/mkdir -p /proc /sys /dev /tmp"
+        mount_lines = [
+            "/bin/mount -t proc proc /proc 2>/dev/null",
+            "/bin/mount -t sysfs sysfs /sys 2>/dev/null",
+            "/bin/mount -t devtmpfs devtmpfs /dev 2>/dev/null",
+        ]
+
+    body = "\n".join([mkdir_line, *mount_lines])
+    return f"""#!/bin/sh
+{body}
+
+if [ "$#" -eq 0 ]; then
+    /bin/echo "oneshot: no command supplied on kernel cmdline (after --); dropping to shell" >&2
+    exec /bin/oneit -p /bin/sh
+fi
+
+exec /bin/oneit -p "$@"
+"""
+
+
+def create_oneshot_initramfs(toybox_path, output_dir, with_9p=True):
+    """Create a gzip-compressed cpio initramfs with toybox + an oneit /init.
+
+    The resulting image is intended for ``--oneshot`` mode: kernel boots
+    initramfs as rootfs, /init mounts pseudo-fs (and optionally the 9p
+    share), then execs ``oneit`` with whatever argv the kernel forwarded
+    after ``--`` on the command line.
+    """
+    toybox_path = Path(toybox_path)
+    if not toybox_path.exists() or not toybox_path.is_file():
+        print(
+            f"Error: toybox binary not found: {toybox_path}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        toybox_data = toybox_path.read_bytes()
+    except OSError as exc:
+        print(f"Error reading toybox binary: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    initramfs_path = output_dir / "oneshot-initramfs.cpio.gz"
+
+    now = int(time.time())
+    archive = bytearray()
+    inode = 1
+
+    init_script = create_oneit_init_script(with_9p=with_9p).encode("utf-8")
+
+    # Directories must precede their contents in cpio order.
+    dir_entries = [
+        ("bin", 2),
+        ("proc", 2),
+        ("sys", 2),
+        ("dev", 2),
+        ("tmp", 2),
+    ]
+    if with_9p:
+        dir_entries.extend([("mnt", 2), ("mnt/share", 2)])
+
+    for dirname, nlink in dir_entries:
+        _append_newc_entry(
+            archive,
+            name=dirname,
+            mode=stat.S_IFDIR | 0o755,
+            mtime=now,
+            inode=inode,
+            nlink=nlink,
+        )
+        inode += 1
+
+    # The toybox multicall binary.
+    _append_newc_entry(
+        archive,
+        name="bin/toybox",
+        mode=stat.S_IFREG | 0o755,
+        mtime=now,
+        data=toybox_data,
+        inode=inode,
+        nlink=1,
+    )
+    inode += 1
+
+    # Symlinks for the applets the /init script (and oneit) needs by basename.
+    for applet in (
+        "sh",
+        "oneit",
+        "mount",
+        "mkdir",
+        "echo",
+        "ln",
+        "cat",
+        "sync",
+        "poweroff",
+        "reboot",
+    ):
+        _append_newc_entry(
+            archive,
+            name=f"bin/{applet}",
+            mode=stat.S_IFLNK | 0o777,
+            mtime=now,
+            data=b"toybox",
+            inode=inode,
+            nlink=1,
+        )
+        inode += 1
+
+    # /init script at the root of the cpio (kernel default rdinit path).
+    _append_newc_entry(
+        archive,
+        name="init",
+        mode=stat.S_IFREG | 0o755,
+        mtime=now,
+        data=init_script,
+        inode=inode,
+        nlink=1,
+    )
+    inode += 1
+
+    _append_newc_entry(
+        archive,
+        name="TRAILER!!!",
+        mode=0,
+        mtime=now,
+        inode=inode,
+        nlink=1,
+    )
+
+    try:
+        with gzip.open(initramfs_path, "wb") as f:
+            f.write(archive)
+    except OSError as exc:
+        print(f"Error writing oneshot initramfs: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    return initramfs_path
+
+
 def create_install_mount_script():
     """Create helper script used inside BusyBox initramfs to mount and install one-run service."""
     return """#!/bin/sh
@@ -984,8 +1293,25 @@ def build_qemu_command(
     initrd_path=None,
     rdinit_path=None,
     onerun_debug=False,
+    oneshot_command=None,
+    enable_9p_share=True,
 ):
-    """Build the QEMU command line arguments."""
+    """Build the QEMU command line arguments.
+
+    When ``oneshot_command`` is provided, the resulting QEMU invocation:
+      * Drops the ``virtio-blk`` rootdisk (initramfs is the only rootfs).
+      * Omits ``root=`` from the kernel cmdline.
+      * Forces ``rdinit=/init``.
+      * Appends ``-- /bin/sh -c "<command>"`` to the kernel cmdline so the
+        kernel forwards argv to /init via its standard ``--`` mechanism.
+
+    When ``enable_9p_share`` is False, the ``virtio-9p-pci`` device and
+    its ``-fsdev`` backing are omitted entirely, which trims a noticeable
+    chunk off the boot path. Only honored in oneshot mode -- the standard
+    one-run flow always needs the share.
+    """
+    oneshot_mode = oneshot_command is not None
+
     cmd = [
         "qemu-system-aarch64",
         "-M",
@@ -994,27 +1320,46 @@ def build_qemu_command(
         "cortex-a57",
         "-m",
         memory,
-        # Disk configuration
-        "-device",
-        "virtio-blk-pci,drive=rootdisk,bootindex=1",
-        "-drive",
-        f"if=none,media=disk,id=rootdisk,file={files['disk']},discard=unmap,detect-zeroes=unmap",
-        # Shared filesystem (9p)
-        "-fsdev",
-        f"local,id=share,path={share_dir.absolute()},security_model=mapped-xattr",
-        "-device",
-        "virtio-9p-pci,fsdev=share,mount_tag=share",
-        # No network
-        "-nic",
-        "none",
-        # QMP control socket
-        "-qmp",
-        f"unix:{qmp_socket_path},server=on,wait=off",
-        "-no-reboot",
-        # Kernel
-        "-kernel",
-        str(files["kernel"]),
     ]
+
+    if not oneshot_mode:
+        # Disk configuration is only used when booting the on-disk rootfs.
+        cmd.extend(
+            [
+                "-device",
+                "virtio-blk-pci,drive=rootdisk,bootindex=1",
+                "-drive",
+                f"if=none,media=disk,id=rootdisk,file={files['disk']},discard=unmap,detect-zeroes=unmap",
+            ]
+        )
+
+    # The 9p share is mandatory for non-oneshot flows (they read scripts from
+    # ./share/tmp). Oneshot can opt out via ``enable_9p_share=False``.
+    share_enabled = enable_9p_share or not oneshot_mode
+    if share_enabled:
+        cmd.extend(
+            [
+                "-fsdev",
+                f"local,id=share,path={share_dir.absolute()},security_model=mapped-xattr",
+                "-device",
+                "virtio-9p-pci,fsdev=share,mount_tag=share",
+            ]
+        )
+
+    cmd.extend(
+        [
+            # No network
+            "-nic",
+            "none",
+            # QMP control socket
+            "-qmp",
+            f"unix:{qmp_socket_path},server=on,wait=off",
+            "-no-reboot",
+            # Kernel
+            "-kernel",
+            str(files["kernel"]),
+        ]
+    )
 
     if nographic:
         cmd.append("-nographic")
@@ -1040,15 +1385,32 @@ def build_qemu_command(
         cmd.extend(["-initrd", str(initrd_path)])
 
     # Build kernel command line
-    kernel_args = "root=/dev/vda2 HOST=aarch64 console=ttyAMA0"
-    if rdinit_path:
-        kernel_args += f" rdinit={rdinit_path}"
-    # debug mode simply omits rdinit and lets the guest boot its own init.
-    if onerun_debug:
-        # Consumed by /usr/local/bin/onerun-runner inside the guest to drop
-        # into an interactive /bin/sh on /dev/ttyAMA0 instead of running a
-        # one-run script.
-        kernel_args += " ONERUN_DEBUG=1"
+    if oneshot_mode:
+        # Initramfs is the only rootfs: no root= and rdinit must point at
+        # the /init shell shim we baked into the oneshot initramfs.
+        kernel_args = "HOST=aarch64 console=ttyAMA0 rdinit=/init"
+        # The kernel forwards everything after `--` on its cmdline as argv
+        # to the init process. We wrap the user command in /bin/sh -c so
+        # the user can pass a full shell command (pipes, redirects, &&,
+        # etc.) without us having to tokenize it on the host side.
+        if '"' in oneshot_command:
+            print(
+                "Warning: --oneshot command contains a literal double-quote; "
+                "the kernel cmdline parser may misinterpret it. Consider "
+                "single-quoting or escaping inner quotes.",
+                file=sys.stderr,
+            )
+        kernel_args += f' -- /bin/sh -c "{oneshot_command}"'
+    else:
+        kernel_args = "root=/dev/vda2 HOST=aarch64 console=ttyAMA0"
+        if rdinit_path:
+            kernel_args += f" rdinit={rdinit_path}"
+        # debug mode simply omits rdinit and lets the guest boot its own init.
+        if onerun_debug:
+            # Consumed by /usr/local/bin/onerun-runner inside the guest to drop
+            # into an interactive /bin/sh on /dev/ttyAMA0 instead of running a
+            # one-run script.
+            kernel_args += " ONERUN_DEBUG=1"
 
     cmd.extend(["-append", kernel_args])
 
@@ -1434,6 +1796,18 @@ Examples:
   # Download Image.gz from a custom tarball URL
   %(prog)s --download-kernel --kernel-url https://example.com/kernel.tar.gz
 
+  # Run a one-shot command in a toybox cpio root ramdisk (no disk image),
+  # similar to `bash -c`. The command is forwarded to /init via the kernel
+  # `--` cmdline mechanism, executed by `oneit`, and the guest powers off
+  # when it exits. -c is a shorthand for --oneshot.
+  %(prog)s --oneshot "echo hello && uname -a"
+  %(prog)s -c "echo hello && uname -a"
+  %(prog)s -c "ls -la /mnt/share" --toybox ./toybox-aarch64
+
+  # Pre-download the toybox binary used by --oneshot (otherwise auto-fetched
+  # on first --oneshot run if no local toybox is found)
+  %(prog)s --download-toybox
+
 Note: For normal runs, keep exactly one *.sh script in ./share/tmp/.
 The kernel Image.gz must be in the current directory.
 Directories ./share and ./share/tmp must exist.
@@ -1531,6 +1905,50 @@ No external dependencies required.
         help=f"URL of the compressed tarball containing boot/Image.gz (default: {DEFAULT_KERNEL_TARBALL_URL})",
     )
 
+    parser.add_argument(
+        "-c",
+        "--oneshot",
+        metavar="CMD",
+        help=(
+            "Boot a toybox cpio root ramdisk and run CMD via 'oneit', "
+            "similar to 'bash -c CMD' / 'sh -c CMD'. The kernel forwards "
+            "CMD to /init using its '--' argv mechanism. No disk image "
+            "required."
+        ),
+    )
+
+    parser.add_argument(
+        "--toybox",
+        metavar="FILE",
+        help=(
+            "Path to the aarch64 toybox binary used by --oneshot "
+            "(default: auto-detect ./toybox-aarch64, ./toybox-arm64, "
+            "or ./toybox; auto-download a prebuilt aarch64 toybox if "
+            "none is found)."
+        ),
+    )
+
+    parser.add_argument(
+        "--download-toybox",
+        action="store_true",
+        help=(
+            f"Download a prebuilt aarch64 toybox to ./toybox-aarch64 if not "
+            f"already present (from {DEFAULT_TOYBOX_URL}). Never overwrites "
+            f"an existing file."
+        ),
+    )
+
+    parser.add_argument(
+        "--no-9p",
+        dest="no_9p",
+        action="store_true",
+        help=(
+            "Skip exposing ./share to the guest via 9p. Only valid with "
+            "--oneshot; trims the QEMU 9p device and the in-guest mount "
+            "for a faster boot when the command does not need /mnt/share."
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.install and args.debug:
@@ -1542,6 +1960,21 @@ No external dependencies required.
     if args.shell and (args.install or args.debug or args.busybox):
         parser.error("--shell cannot be combined with --install, --debug, or --busybox")
 
+    if args.oneshot is not None and (
+        args.install or args.debug or args.busybox or args.shell
+    ):
+        parser.error(
+            "--oneshot cannot be combined with --install, --debug, --busybox, or --shell"
+        )
+
+    if args.oneshot is not None and args.snapshot:
+        parser.error("--oneshot does not use the disk image, so --snapshot is meaningless")
+
+    if args.no_9p and args.oneshot is None:
+        parser.error(
+            "--no-9p is only valid with --oneshot; other modes need the 9p share"
+        )
+
     # Optionally fetch the kernel before any other checks so that a fresh
     # workspace can be bootstrapped with a single command.
     if args.download_kernel:
@@ -1552,10 +1985,22 @@ No external dependencies required.
         )
         print()
 
-    # Check directories exist
-    share_dir, tmp_dir = check_directories()
-    print(f"Share directory: {share_dir.absolute()}")
-    print(f"Scratch directory: {tmp_dir.absolute()}")
+    if args.download_toybox:
+        download_toybox()
+        print()
+
+    # Check directories exist. In --oneshot mode the guest does not run a
+    # ./share/tmp/*.sh script, so we relax the requirement and only insist
+    # that ./share itself exists (we still expose it over 9p for convenience).
+    if args.oneshot is not None:
+        share_dir = Path("./share")
+        share_dir.mkdir(parents=True, exist_ok=True)
+        tmp_dir = share_dir / "tmp"
+        print(f"Share directory: {share_dir.absolute()}")
+    else:
+        share_dir, tmp_dir = check_directories()
+        print(f"Share directory: {share_dir.absolute()}")
+        print(f"Scratch directory: {tmp_dir.absolute()}")
 
     # --shell (or ONERUN_DEBUG=1 in the host environment) is propagated onto
     # the kernel cmdline and tells the in-guest onerun-runner to drop into an
@@ -1565,17 +2010,33 @@ No external dependencies required.
         source = "--shell" if args.shell else "ONERUN_DEBUG=1"
         print(f"{source}: guest will drop to /bin/sh on serial console.")
 
-    # Normal one-run mode requires exactly one shell script in ./share/tmp. Debug
-    # mode skips the check because no script will be executed.
-    if not args.install and not args.debug and not args.busybox and not onerun_debug:
+    # Normal one-run mode requires exactly one shell script in ./share/tmp. Debug,
+    # busybox, shell, and oneshot modes all skip that check.
+    if (
+        not args.install
+        and not args.debug
+        and not args.busybox
+        and not onerun_debug
+        and args.oneshot is None
+    ):
         script_path = check_onerun_script(tmp_dir)
         print(f"One-run script: {script_path.absolute()}")
 
-    # Check for required files
+    # Check for required files. --oneshot boots from initramfs only, so the
+    # disk image is not required (and we explicitly do not attach one).
     print("Checking for required files...")
-    files = check_required_files(args.disk)
-    print(f"Kernel: {files['kernel']}")
-    print(f"Disk: {files['disk']}")
+    if args.oneshot is not None:
+        kernel_path = Path("Image.gz")
+        if not kernel_path.exists():
+            print("Error: Missing required files: Image.gz", file=sys.stderr)
+            sys.exit(1)
+        files = {"kernel": kernel_path.absolute()}
+        print(f"Kernel: {files['kernel']}")
+        print("Disk: (none - oneshot boots from initramfs)")
+    else:
+        files = check_required_files(args.disk)
+        print(f"Kernel: {files['kernel']}")
+        print(f"Disk: {files['disk']}")
 
     # For install mode, create a rollback snapshot first
     if args.install:
@@ -1608,6 +2069,26 @@ No external dependencies required.
             rdinit_path = "/bin/sh"
             print("Booting with rdinit=/bin/sh from initramfs.")
 
+        print()
+
+    # --oneshot: build a toybox-based cpio root ramdisk. /init mounts proc/sys/
+    # dev (and the 9p share unless --no-9p is set) and execs `oneit` with
+    # whatever argv the kernel forwarded after the `--` separator on the
+    # kernel command line.
+    if args.oneshot is not None:
+        toybox_path = resolve_toybox_binary_path(args.toybox)
+        initrd_path = create_oneshot_initramfs(
+            toybox_path=toybox_path,
+            output_dir=Path("./tmp"),
+            with_9p=not args.no_9p,
+        )
+        # rdinit is baked into the kernel cmdline by build_qemu_command in
+        # oneshot mode, so leave rdinit_path unset here.
+        print(f"Using toybox binary: {toybox_path.absolute()}")
+        print(f"Prepared oneshot initramfs: {initrd_path}")
+        print(f"Oneshot command: {args.oneshot}")
+        if args.no_9p:
+            print("9p share: disabled (--no-9p)")
         print()
 
     # Create additional snapshot if requested
@@ -1654,6 +2135,8 @@ No external dependencies required.
         initrd_path=initrd_path,
         rdinit_path=rdinit_path,
         onerun_debug=onerun_debug,
+        oneshot_command=args.oneshot,
+        enable_9p_share=not args.no_9p,
     )
 
     print("\nQEMU command:")
