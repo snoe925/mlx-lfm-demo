@@ -1,6 +1,9 @@
 import argparse
+import os
+import re
 import sys
 import json
+import datetime
 from .lfm_chat import LfmChat
 from . import tools
 
@@ -14,6 +17,59 @@ def _print_new_messages(previous, current):
             print(f"[tool] {message.get('content', '')}")
         elif role == "user":
             print("user")
+
+
+def _append_new_messages_jsonl(jsonl_path, previous_conversation, current_conversation):
+    new_messages = current_conversation[len(previous_conversation):]
+    if not new_messages:
+        return
+    with open(jsonl_path, "a") as f:
+        for msg in new_messages:
+            enriched = {**msg, "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat()}
+            f.write(json.dumps(enriched, ensure_ascii=False) + "\n")
+
+
+def _log_event(jsonl_path, event_type, **extra):
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    event = {"role": "event", "event": event_type, "timestamp": timestamp, **extra}
+    with open(jsonl_path, "a") as f:
+        f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
+def _rotate_jsonl_log(jsonl_path):
+    """Rotate an existing JSONL log to ``<jsonl_path>.<N>``.
+
+    The first rotation produces ``<jsonl_path>.0``, the second ``.1``, and so
+    on. The next suffix is chosen by scanning the parent directory for files
+    matching ``<basename>.<int>`` and taking ``max + 1``. Returns the new path
+    on success, or ``None`` if there was nothing to rotate.
+    """
+    if not jsonl_path or not os.path.exists(jsonl_path):
+        return None
+
+    parent = os.path.dirname(jsonl_path) or "."
+    base = os.path.basename(jsonl_path)
+    pattern = re.compile(r"^" + re.escape(base) + r"\.(\d+)$")
+
+    max_n = -1
+    try:
+        entries = os.listdir(parent)
+    except OSError:
+        entries = []
+    for name in entries:
+        match = pattern.match(name)
+        if match is None:
+            continue
+        try:
+            n = int(match.group(1))
+        except ValueError:
+            continue
+        if n > max_n:
+            max_n = n
+
+    rotated = f"{jsonl_path}.{max_n + 1}"
+    os.rename(jsonl_path, rotated)
+    return rotated
 
 
 def main():
@@ -42,12 +98,31 @@ def main():
         action="store_true",
         help="Explicitly start with sandbox mode ON (the default).",
     )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        help="File containing the prompt to send. If '-', read from stdin.",
+    )
+    parser.add_argument(
+        "--no-jsonl",
+        action="store_true",
+        help="Disable automatic JSONL chat logging (default: logs to chat_log.jsonl).",
+    )
+    parser.add_argument(
+        "--jsonl-path",
+        type=str,
+        default="chat_log.jsonl",
+        help="Path for the JSONL chat log (default: chat_log.jsonl).",
+    )
     args = parser.parse_args()
 
     if args.no_sandbox and args.sandbox:
         parser.error("--sandbox and --no-sandbox are mutually exclusive")
 
     tools.set_sandbox_enabled(not args.no_sandbox)
+
+    # Resolve JSONL logging path
+    jsonl_path = None if args.no_jsonl else args.jsonl_path
 
     # If we are starting in sandbox mode, verify the environment before we
     # spend time loading the model. Missing qemu / missing kernel / missing
@@ -70,9 +145,72 @@ def main():
             )
             sys.exit(1)
 
-    # Initialize chat instance
+    # Rotate any existing JSONL log to chat_log.jsonl.N before opening a fresh
+    # one for this session. Done after preflight so we don't churn the log
+    # directory when the CLI is about to exit with a sandbox error.
+    if jsonl_path:
+        rotated = _rotate_jsonl_log(jsonl_path)
+        if rotated:
+            print(f"Rotated previous chat log to {rotated}")
+        _log_event(jsonl_path, "session_start")
+
+    # Initialize the chat instance once and reuse it across prompt-mode and
+    # interactive mode. LfmChat() loads model weights which is the slowest
+    # step in startup; constructing it twice (once just to grab system_content
+    # for logging) would double that cost.
     chat = LfmChat()
-    # Conversation history
+
+    if jsonl_path:
+        _log_event(jsonl_path, "system_prompt", content=chat.system_content)
+
+    # Handle prompt argument if provided
+    if args.prompt is not None:
+        if args.prompt == "-":
+            # Read from stdin
+            prompt_content = sys.stdin.read()
+        else:
+            # Read from file
+            try:
+                with open(args.prompt, "r") as f:
+                    prompt_content = f.read()
+            except FileNotFoundError:
+                print(f"Error: Prompt file '{args.prompt}' not found.", file=sys.stderr)
+                sys.exit(1)
+            except Exception as e:
+                print(f"Error reading prompt file '{args.prompt}': {e}", file=sys.stderr)
+                sys.exit(1)
+
+        # Conversation history with the prompt as the first user message
+        conversation = [{"role": "user", "content": prompt_content}]
+
+        # Process the chat loop
+        max_turns = 20
+        for _ in range(max_turns):
+            previous_conversation = list(conversation)
+            # Surface a clear "model running" marker before each
+            # model invocation so the user knows why the CLI is
+            # unresponsive (mlx_lm's stream_generate can take a
+            # noticeable amount of time to start producing output).
+            print("model", flush=True)
+            conversation = chat.chat(conversation)
+            _print_new_messages(previous_conversation, conversation)
+            if jsonl_path:
+                _append_new_messages_jsonl(jsonl_path, previous_conversation, conversation)
+
+            previous_conversation = list(conversation)
+            conversation = chat.execute_tool_calls(conversation)
+            _print_new_messages(previous_conversation, conversation)
+            if jsonl_path:
+                _append_new_messages_jsonl(jsonl_path, previous_conversation, conversation)
+
+            if len(previous_conversation) == len(conversation):
+                print("user", flush=True)
+                break
+
+        # Exit after processing
+        sys.exit(0)
+
+    # Initialize conversation history for interactive mode
     conversation = []
 
     print(
@@ -118,10 +256,14 @@ def main():
                     print("model", flush=True)
                     conversation = chat.chat(conversation)
                     _print_new_messages(previous_conversation, conversation)
+                    if jsonl_path:
+                        _append_new_messages_jsonl(jsonl_path, previous_conversation, conversation)
 
                     previous_conversation = list(conversation)
                     conversation = chat.execute_tool_calls(conversation)
                     _print_new_messages(previous_conversation, conversation)
+                    if jsonl_path:
+                        _append_new_messages_jsonl(jsonl_path, previous_conversation, conversation)
 
                     if len(previous_conversation) == len(conversation):
                         print("user", flush=True)
@@ -129,6 +271,8 @@ def main():
             elif line == "/clear":
                 # Clear the conversation history
                 conversation = []
+                if jsonl_path:
+                    _log_event(jsonl_path, "clear")
                 print("Conversation history cleared.")
             elif line == "/context":
                 # Dump conversation context as JSON
@@ -164,10 +308,15 @@ def main():
                 )
             elif line == "/quit":
                 # Exit the program
+                if jsonl_path:
+                    _log_event(jsonl_path, "session_end")
                 break
             else:
                 # Add user message to conversation
                 conversation.append({"role": "user", "content": line})
+                if jsonl_path:
+                    _append_new_messages_jsonl(jsonl_path, conversation[:-1], conversation)
+
     except KeyboardInterrupt:
         print("\nExiting...")
 

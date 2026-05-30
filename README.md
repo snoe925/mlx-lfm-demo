@@ -20,6 +20,18 @@ Add more step wise tests in pytest.
 The tools are: `read_file`, `write_file`, `list_files`, `wget`, `clean_tmp` and
 `linux`.
 
+## Smoke Tests
+
+Smoke tests are quick checks to verify basic tool functionality. For example, to test the `wget` tool you can download a publicly available zip file:
+
+```bash
+python - <<'PY'
+from share.tools import wget
+wget('https://github.com/pytorch/pytorch/archive/refs/heads/main.zip', 'test.zip')
+PY
+
+This will download the zip and print a success message.
+
 All tool I/O is confined to `./share/`.  Scripts and downloads live under
 `./share/tmp/`, and subdirectories anywhere under `./share/` are allowed.
 

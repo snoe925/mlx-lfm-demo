@@ -21,7 +21,8 @@ class BaseChat(ABC):
 
 class Chat(BaseChat):
     def __init__(self, model_name: Optional[str] = None):
-        self.model_name = model_name or "LiquidAI/LFM2.5-1.2B-Instruct"
+        #self.model_name = model_name or "LiquidAI/LFM2.5-1.2B-Instruct"
+        self.model_name = model_name or "LiquidAI/LFM2.5-8B-A1B"
         self.model = None
         self.tokenizer = None
         self.tools = TOOLS
